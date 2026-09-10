@@ -3,15 +3,16 @@ const testing = std.testing;
 const assert = std.debug.assert;
 const ascii = std.ascii;
 const mem = std.mem;
-const io = std.io;
+const Io = std.Io;
 const fmt = std.fmt;
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+var base64Encoder = std.base64.standard.Encoder;
+const http = std.http;
+const builtin = @import("builtin");
 
 const Options = @import("stream.zig").Options;
 
 const WS_MAGIC_KEY = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-var base64Encoder = std.base64.standard.Encoder;
 var rnd = std.Random.DefaultPrng.init(0);
 
 pub fn secKey() [24]u8 {
@@ -64,171 +65,176 @@ test "isValidSecAccept" {
 
 const crlf = "\r\n";
 
-pub fn Client(comptime ReaderType: type, comptime WriterType: type) type {
-    return struct {
-        reader: ReaderType,
-        writer: WriterType,
-        arena: std.heap.ArenaAllocator,
-        sec_key: [24]u8,
-        options: Options = .{},
+pub const Client = struct {
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    arena: std.heap.ArenaAllocator,
+    sec_key: [24]u8,
+    options: Options = .{},
 
-        const Self = @This();
+    const Self = @This();
 
-        pub fn init(allocator: Allocator, reader: ReaderType, writer: WriterType) Self {
-            return .{
-                .reader = reader,
-                .writer = writer,
-                .sec_key = secKey(),
-                .arena = std.heap.ArenaAllocator.init(allocator),
-            };
-        }
+    pub fn init(allocator: Allocator, reader: *Io.Reader, writer: *Io.Writer) Self {
+        return .{
+            .reader = reader,
+            .writer = writer,
+            .sec_key = secKey(),
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
+    }
 
-        pub fn deinit(self: *Self) void {
-            self.arena.deinit();
-        }
+    pub fn deinit(self: *Self) void {
+        self.arena.deinit();
+    }
 
-        pub fn writeRequest(self: *Self, uri: []const u8) !void {
-            var buf: [1024]u8 = undefined;
-            try self.writer.writeAll(try requestBufPrint(&buf, uri, &self.sec_key));
-        }
+    pub fn writeRequest(self: *Self, uri: []const u8) !void {
+        var buf: [1024]u8 = undefined;
+        try self.writer.writeAll(try requestBufPrint(&buf, uri, &self.sec_key));
+    }
 
-        pub fn assertValidResponse(self: *Self) !void {
-            var rsp = try self.parseResponse();
-            try rsp.assertWebSocketUpgrade(&self.sec_key);
-            self.readOptions(&rsp);
-        }
+    pub fn assertValidResponse(self: *Self) !void {
+        var rsp = try self.parseResponse();
+        try rsp.assertWebSocketUpgrade(&self.sec_key);
+        self.readOptions(&rsp);
+    }
 
-        fn readOptions(self: *Self, rsp: *Response) void {
-            for (rsp.headers) |h| {
-                if (h.keyMatch("sec-websocket-extensions")) {
-                    self.options.per_message_deflate = h.valueIncludes("permessage-deflate");
-                    self.options.server_no_context_takeover = h.valueIncludes("server_no_context_takeover");
-                    self.options.client_no_context_takeover = h.valueIncludes("client_no_context_takeover");
-                    if (h.paramValue("server_max_window_bits")) |v|
-                        self.options.server_max_window_bits = std.fmt.parseInt(u4, v, 10) catch 15;
-                    if (h.paramValue("client_max_window_bits")) |v|
-                        self.options.client_max_window_bits = std.fmt.parseInt(u4, v, 10) catch 15;
-                }
+    fn readOptions(self: *Self, rsp: *Response) void {
+        for (rsp.headers) |h| {
+            if (h.keyMatch("sec-websocket-extensions")) {
+                self.options.per_message_deflate = h.valueIncludes("permessage-deflate");
+                self.options.server_no_context_takeover = h.valueIncludes("server_no_context_takeover");
+                self.options.client_no_context_takeover = h.valueIncludes("client_no_context_takeover");
+                if (h.paramValue("server_max_window_bits")) |v|
+                    self.options.server_max_window_bits = std.fmt.parseInt(u4, v, 10) catch 15;
+                if (h.paramValue("client_max_window_bits")) |v|
+                    self.options.client_max_window_bits = std.fmt.parseInt(u4, v, 10) catch 15;
             }
         }
+    }
 
-        const max_response_line_len = 1024;
+    const max_response_line_len = 1024;
 
-        const Header = struct {
-            key: []const u8,
-            value: []const u8,
+    const Header = struct {
+        key: []const u8,
+        value: []const u8,
 
-            pub fn keyMatch(h: Header, key: []const u8) bool {
-                return ascii.eqlIgnoreCase(h.key, key);
-            }
+        pub fn keyMatch(h: Header, key: []const u8) bool {
+            return ascii.eqlIgnoreCase(h.key, key);
+        }
 
-            pub fn valueIncludes(h: Header, needle: []const u8) bool {
-                return ascii.indexOfIgnoreCase(h.value, needle) != null;
-            }
+        pub fn valueIncludes(h: Header, needle: []const u8) bool {
+            return ascii.indexOfIgnoreCase(h.value, needle) != null;
+        }
 
-            pub fn paramValue(h: Header, param: []const u8) ?[]const u8 {
-                var it = std.mem.tokenizeAny(u8, h.value, ";= ");
-                while (it.next()) |k| {
-                    if (ascii.eqlIgnoreCase(k, param)) {
-                        if (it.next()) |v| {
-                            return v;
-                        }
+        pub fn paramValue(h: Header, param: []const u8) ?[]const u8 {
+            var it = std.mem.tokenizeAny(u8, h.value, ";= ");
+            while (it.next()) |k| {
+                if (ascii.eqlIgnoreCase(k, param)) {
+                    if (it.next()) |v| {
+                        return v;
                     }
                 }
-                return null;
             }
+            return null;
+        }
 
-            pub fn match(h: Header, key: []const u8, value: []const u8) bool {
-                return (ascii.eqlIgnoreCase(h.key, key) and
-                    ascii.eqlIgnoreCase(h.value, value));
-            }
-        };
-
-        const Response = struct {
-            protocol: []const u8,
-            status: []const u8,
-            status_description: []const u8,
-            headers: []Header,
-
-            pub fn assertWebSocketUpgrade(rsp: *Response, sec_key: []const u8) !void {
-                if (!rsp.isWebSocketUpgrade(sec_key)) return error.NotWebsocketUpgradeResponse;
-            }
-
-            pub fn isWebSocketUpgrade(rsp: *Response, sec_key: []const u8) bool {
-                if (!mem.eql(u8, rsp.status, "101")) return false;
-
-                var upgrade_headers: usize = 0;
-                var sec_accept_valid = false;
-
-                for (rsp.headers) |h| {
-                    if (h.match("upgrade", "websocket")) upgrade_headers += 1;
-                    if (h.match("connection", "upgrade")) upgrade_headers += 1;
-                    if (h.keyMatch("sec-websocket-accept")) {
-                        sec_accept_valid = isValidSecAccept(sec_key, h.value);
-                    }
-                }
-
-                return upgrade_headers == 2 and sec_accept_valid;
-            }
-        };
-
-        pub fn parseResponse(self: *Self) !Response {
-            // parse status line
-            var status_line = try self.reader.readUntilDelimiterAlloc(self.arena.allocator(), '\n', max_response_line_len);
-            if (std.mem.endsWith(u8, status_line, "\r")) {
-                status_line = status_line[0 .. status_line.len - 1];
-            }
-            const sp1 = mem.indexOfScalar(u8, status_line, ' ') orelse return error.InvalidHttpResponse;
-            const sp2 = mem.indexOfScalarPos(u8, status_line, sp1 + 1, ' ') orelse return error.InvalidHttpResponse;
-            const protocol = status_line[0..sp1];
-            const status = status_line[sp1 + 1 .. sp2];
-            const status_description = status_line[sp2 + 1 ..];
-
-            // parse headers
-            var headers = std.ArrayList(Header).init(self.arena.allocator());
-            defer headers.deinit();
-            while (true) {
-                var header_line = try self.reader.readUntilDelimiterAlloc(self.arena.allocator(), '\n', max_response_line_len);
-                if (std.mem.endsWith(u8, header_line, "\r")) {
-                    header_line = header_line[0 .. header_line.len - 1];
-                }
-                if (header_line.len == 0)
-                    break;
-
-                const index = std.mem.indexOfScalar(u8, header_line, ':') orelse return error.InvalidHeader;
-
-                const whitespace = " \t";
-                const key = std.mem.trim(u8, header_line[0..index], whitespace);
-                const value = std.mem.trim(u8, header_line[index + 1 ..], whitespace);
-
-                try headers.append(Header{ .key = key, .value = value });
-            }
-
-            return Response{
-                .protocol = protocol,
-                .status = status,
-                .status_description = status_description,
-                .headers = try headers.toOwnedSlice(),
-            };
+        pub fn match(h: Header, key: []const u8, value: []const u8) bool {
+            return (ascii.eqlIgnoreCase(h.key, key) and
+                ascii.eqlIgnoreCase(h.value, value));
         }
     };
-}
 
-fn clientInit(allocator: Allocator, reader: anytype, writer: anytype) Client(@TypeOf(reader), @TypeOf(writer)) {
-    return Client(@TypeOf(reader), @TypeOf(writer)).init(allocator, reader, writer);
-}
+    const Response = struct {
+        protocol: []const u8,
+        status: []const u8,
+        status_description: []const u8,
+        headers: []Header,
 
-// do client handshake using stream
-// error on unsuccessful handshake
-pub fn client(allocator: Allocator, reader: anytype, writer: anytype, uri: []const u8) !Options {
-    var cs = clientInit(allocator, reader, writer);
+        pub fn assertWebSocketUpgrade(rsp: *Response, sec_key: []const u8) !void {
+            if (!rsp.isWebSocketUpgrade(sec_key)) return error.NotWebsocketUpgradeResponse;
+        }
+
+        pub fn isWebSocketUpgrade(rsp: *Response, sec_key: []const u8) bool {
+            if (!mem.eql(u8, rsp.status, "101")) return false;
+
+            var upgrade_headers: usize = 0;
+            var sec_accept_valid = false;
+
+            for (rsp.headers) |h| {
+                if (h.match("upgrade", "websocket")) upgrade_headers += 1;
+                if (h.match("connection", "upgrade")) upgrade_headers += 1;
+                if (h.keyMatch("sec-websocket-accept")) {
+                    sec_accept_valid = isValidSecAccept(sec_key, h.value);
+                }
+            }
+
+            return upgrade_headers == 2 and sec_accept_valid;
+        }
+    };
+
+    pub fn parseResponse(self: *Self) !Response {
+        // parse status line
+        var status_line = (try self.reader.takeDelimiter('\n')) orelse return error.InvalidHttpResponse;
+        if (std.mem.endsWith(u8, status_line, "\r")) {
+            status_line = status_line[0 .. status_line.len - 1];
+        }
+        const sp1 = mem.indexOfScalar(u8, status_line, ' ') orelse return error.InvalidHttpResponse;
+        const sp2 = mem.indexOfScalarPos(u8, status_line, sp1 + 1, ' ') orelse return error.InvalidHttpResponse;
+
+        const alloc = self.arena.allocator();
+        const protocol = try alloc.dupe(u8, status_line[0..sp1]);
+        const status = try alloc.dupe(u8, status_line[sp1 + 1 .. sp2]);
+        const status_description = try alloc.dupe(u8, status_line[sp2 + 1 ..]);
+
+        // parse headers
+        var headers: std.ArrayList(Header) = .empty;
+        defer headers.deinit(alloc);
+        while (true) {
+            var header_line = (try self.reader.takeDelimiter('\n')) orelse return error.InvalidHttpResponse;
+            if (std.mem.endsWith(u8, header_line, "\r")) {
+                header_line = header_line[0 .. header_line.len - 1];
+            }
+            if (header_line.len == 0)
+                break;
+
+            const index = std.mem.indexOfScalar(u8, header_line, ':') orelse return error.InvalidHeader;
+
+            const whitespace = " \t";
+            const key = std.mem.trim(u8, header_line[0..index], whitespace);
+            const value = std.mem.trim(u8, header_line[index + 1 ..], whitespace);
+
+            try headers.append(alloc, Header{
+                .key = try alloc.dupe(u8, key),
+                .value = try alloc.dupe(u8, value),
+            });
+        }
+
+        return Response{
+            .protocol = protocol,
+            .status = status,
+            .status_description = status_description,
+            .headers = try headers.toOwnedSlice(alloc),
+        };
+    }
+};
+
+/// Performs the client-side WebSocket handshake.
+///
+/// The caller must provide a `reader` backed by a buffer large enough to hold
+/// a complete HTTP response status line. HTTP/1.1 (RFC 7230) recommends that
+/// servers support request-line lengths of at least 8000 octets; for broad
+/// compatibility a buffer of at least 8192 bytes is recommended. A buffer of
+/// 1024 bytes is sufficient for typical WebSocket handshake responses.
+///
+/// Returns the negotiated `Options`, or an error if the server did not return
+/// a valid WebSocket upgrade response.
+pub fn client(allocator: Allocator, reader: *Io.Reader, writer: *Io.Writer, uri: []const u8) !Options {
+    var cs: Client = .init(allocator, reader, writer);
     defer cs.deinit();
     try cs.writeRequest(uri);
     try cs.assertValidResponse();
     return cs.options;
 }
-
-const testing_stream = @import("testing_stream.zig");
 
 test "parse response" {
     const http_server_response =
@@ -240,8 +246,10 @@ test "parse response" {
         \\
         \\
     ;
-    var stm = testing_stream.init(http_server_response);
-    var cs = clientInit(testing.allocator, stm.reader(), stm.writer());
+    var input = Io.Reader.fixed(http_server_response);
+    var output: Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    var cs: Client = .init(testing.allocator, &input, &output.writer);
     defer cs.deinit();
     var rsp = try cs.parseResponse();
     const sec_key = "3yMLSWFdF1MH1YDDPW/aYQ==";
@@ -270,9 +278,11 @@ test "valid ws handshake" {
         "Connection: Upgrade\r\n" ++
         "Sec-WebSocket-Accept: 9bQuZIN64KrRsqgxuR1CxYN94zQ=\r\n\r\n";
 
-    var stm = testing_stream.init(http_response);
-    _ = try client(testing.allocator, stm.reader(), stm.writer(), "ws://ws.example.com/ws");
-    try testing.expectEqualSlices(u8, stm.written(), &http_request.*);
+    var input = Io.Reader.fixed(http_response);
+    var output: Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    _ = try client(testing.allocator, &input, &output.writer, "ws://ws.example.com/ws");
+    try testing.expectEqualSlices(u8, output.written(), http_request);
 }
 
 test "read server_max_window_bits" {
@@ -286,10 +296,10 @@ test "read server_max_window_bits" {
         crlf;
 
     var output: [1024]u8 = undefined;
-    var in_stm = io.fixedBufferStream(http_response);
-    var out_stm = io.fixedBufferStream(&output);
+    var in_stm: Io.Reader = .fixed(http_response);
+    var out_stm: Io.Writer = .fixed(&output);
 
-    var cs = clientInit(testing.allocator, in_stm.reader(), out_stm.writer());
+    var cs: Client = .init(testing.allocator, &in_stm, &out_stm);
     defer cs.deinit();
     var rsp = try cs.parseResponse();
     cs.readOptions(&rsp);
@@ -334,8 +344,6 @@ test "parseHost from uri" {
     try testing.expectEqualStrings("something", parseHost("something"));
 }
 
-const http = std.http;
-
 pub const Rsp = struct {
     const Self = @This();
 
@@ -367,7 +375,7 @@ pub const Rsp = struct {
         };
         if (first_line[8] != ' ') return error.HttpHeadersInvalid;
         const status: http.Status = @enumFromInt(try std.fmt.parseInt(u10, first_line[9..12], 10));
-        const reason = mem.trimLeft(u8, first_line[12..], " ");
+        const reason = mem.trimStart(u8, first_line[12..], " ");
         _ = reason;
         _ = version;
 
@@ -480,7 +488,7 @@ pub const Req = struct {
         if (method_end > 24) return error.HttpHeadersInvalid;
 
         const method_str = first_line[0..method_end];
-        const method: http.Method = @enumFromInt(http.Method.parse(method_str));
+        const method: http.Method = std.meta.stringToEnum(http.Method, method_str) orelse return error.InvalidMethod;
 
         const version_start = mem.lastIndexOfScalar(u8, first_line, ' ') orelse
             return error.HttpHeadersInvalid;

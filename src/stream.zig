@@ -1,10 +1,13 @@
 const std = @import("std");
-const io = std.io;
+const Io = std.Io;
 const mem = std.mem;
-
 const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 const utf8ValidateSlice = std.unicode.utf8ValidateSlice;
+const testing = std.testing;
+const expectEqual = testing.expectEqual;
+const expectEqualSlices = testing.expectEqualSlices;
+const expectError = testing.expectError;
 
 const Frame = @import("frame.zig").Frame;
 
@@ -55,26 +58,23 @@ pub const Message = struct {
         self.payload = payload;
     }
 
-    pub fn decompress(self: *Message, allocator: mem.Allocator, decompressor: anytype) !void {
+    pub fn decompress(self: *Message, allocator: mem.Allocator, decompress_buf: []u8) !void {
         if (!self.compressed) return;
 
-        var output = std.ArrayList(u8).init(allocator);
+        // add empty stored block
+        const input = try allocator.alloc(u8, self.payload.len + 4);
+        defer allocator.free(input);
+        @memcpy(input[0..self.payload.len], self.payload);
+        @memcpy(input[self.payload.len..], &[_]u8{ 0x00, 0x00, 0xff, 0xff });
+
+        var output: Io.Writer.Allocating = .init(allocator);
         defer output.deinit();
 
         // push payload to decompressor
-        var input = io.fixedBufferStream(self.payload);
-        decompressor.setReader(input.reader());
-        decompressor.decompress(output.writer()) catch |err| switch (err) {
-            error.EndOfStream => {},
-            else => return err,
-        };
-        // add empty stored block
-        input = io.fixedBufferStream(&[_]u8{ 0x00, 0x00, 0xff, 0xff });
-        decompressor.setReader(input.reader());
-        decompressor.decompress(output.writer()) catch |err| switch (err) {
-            error.EndOfStream => {},
-            else => return err,
-        };
+        var in_reader: Io.Reader = .fixed(input);
+        var decompressor: std.compress.flate.Decompress = .init(&in_reader, .raw, decompress_buf);
+
+        _ = try decompressor.reader.streamRemaining(&output.writer);
 
         const old_payload = self.payload;
         self.payload = try output.toOwnedSlice();
@@ -105,367 +105,361 @@ pub const Options = struct {
     compress_threshold: usize = 126,
 };
 
-pub fn Stream(comptime ReaderType: type, comptime WriterType: type) type {
-    return struct {
-        // NOTE: @sizeOf DecompressorType: 76312  CompressorType: 404760
-        const DecompressorType = std.compress.flate.Decompressor(io.FixedBufferStream([]const u8).Reader);
-        const CompressorType = std.compress.flate.Compressor(std.ArrayList(u8).Writer);
-        const Self = @This();
+pub const Stream = struct {
+    const CompressorType = std.compress.flate.Compress;
+    const Self = @This();
 
-        reader: Reader(ReaderType),
-        writer: Writer(WriterType),
+    reader: WebSocketReader,
+    writer: WebSocketWriter,
 
-        allocator: Allocator,
-        err: ?anyerror = null,
+    allocator: Allocator,
+    err: ?anyerror = null,
 
-        // used in validation
-        last_frame_fragment: Frame.Fragment = .unfragmented,
+    // used in validation
+    last_frame_fragment: Frame.Fragment = .unfragmented,
 
-        // message compression
-        decompressor: ?*DecompressorType = null, // not null if per_message_deflate is negotiated
-        compressor: ?*CompressorType = null, //     not null if per_message_deflate is negotiated
-        reset_compressor: bool = false, //          true if sliding window is not negotiated
-        reset_decompressor: bool = false, //        true if sliding window is not negotiated
-        compress_threshold: usize = 126, //         don't compress tiny payload
+    // message compression
+    compressor: ?*CompressorType = null, //     not null if per_message_deflate is negotiated
+    compressor_output: ?*std.Io.Writer.Allocating = null, // sink
+    compressor_buf: ?[]u8 = null,
+    decompressor_buf: ?[]u8 = null,
+    reset_compressor: bool = false, //          true if sliding window is not negotiated
+    compress_threshold: usize = 126, //         don't compress tiny payload
 
-        fn resetCompressor(self: *Self) void {
-            var dummy = std.ArrayList(u8).init(self.allocator);
-            defer dummy.deinit();
-            self.compressor.?.* = CompressorType.init(dummy.writer(), .{}) catch unreachable;
-        }
+    fn resetCompressor(self: *Self) void {
+        const output = self.compressor_output.?;
+        self.compressor.?.* = CompressorType.init(
+            &output.writer,
+            self.compressor_buf.?,
+            .raw,
+            .default,
+        ) catch unreachable;
+    }
 
-        fn resetDecompressor(self: *Self) void {
-            self.decompressor.?.* = .{};
-        }
-
-        fn readDataFrame(self: *Self) !Frame {
-            while (true) {
-                var frame = try self.reader.frame();
-                if (frame.isControl()) {
-                    defer frame.deinit();
-                    try self.handleControlFrame(&frame);
-                } else {
-                    errdefer frame.deinit();
-                    try frame.assertValidContinuation(self.last_frame_fragment);
-                    self.last_frame_fragment = frame.fragment();
-                    return frame;
-                }
-            }
-        }
-
-        fn handleControlFrame(self: *Self, frame: *Frame) !void {
-            switch (frame.opcode) {
-                .ping => try self.writer.pong(frame.payload),
-                .close => {
-                    try self.writer.close(frame.closeCode(), frame.closePayload());
-                    return error.EndOfStream;
-                },
-                .pong => {},
-                else => unreachable,
-            }
-        }
-
-        fn setErr(self: *Self, err: anyerror) void {
-            if (err != error.EndOfStream) self.err = err;
-        }
-
-        pub fn nextMessage(self: *Self) ?Message {
-            return self.readMessage() catch |err| {
-                self.setErr(err);
-                return null;
-            };
-        }
-
-        fn decompress(self: *Self, msg: *Message) !void {
-            if (msg.compressed) {
-                const decompressor = self.decompressor orelse return error.DeflateNotSupported;
-                try msg.decompress(self.allocator, decompressor);
-                if (self.reset_decompressor) decompressor.* = .{};
-            }
-            try msg.validate();
-        }
-
-        fn readMessage(self: *Self) !Message {
-            // read first frame
-            var frame = try self.readDataFrame();
-
-            if (frame.isFin()) {
-                // if single frame return frame payload as message payload
-                // message takes ownership of the allocated payload
+    fn readDataFrame(self: *Self) !Frame {
+        while (true) {
+            var frame = try self.reader.frame(self.allocator);
+            if (frame.isControl()) {
+                defer frame.deinit();
+                try self.handleControlFrame(&frame);
+            } else {
                 errdefer frame.deinit();
-                var msg = Message{
-                    .encoding = Message.Encoding.from(frame.opcode),
-                    .compressed = frame.isCompressed(),
-                    .allocator = self.allocator,
-                    .payload = frame.payload,
-                };
-                try self.decompress(&msg);
-                return msg;
+                try frame.assertValidContinuation(self.last_frame_fragment);
+                self.last_frame_fragment = frame.fragment();
+                return frame;
             }
+        }
+    }
 
-            // other frames payload will be collected into payload
+    fn handleControlFrame(self: *Self, frame: *Frame) !void {
+        switch (frame.opcode) {
+            .ping => try self.writer.pong(frame.payload),
+            .close => {
+                try self.writer.close(frame.closeCode(), frame.closePayload());
+                return error.EndOfStream;
+            },
+            .pong => {},
+            else => unreachable,
+        }
+    }
+
+    fn setErr(self: *Self, err: anyerror) void {
+        if (err != error.EndOfStream) self.err = err;
+    }
+
+    pub fn nextMessage(self: *Self) ?Message {
+        return self.readMessage() catch |err| {
+            self.setErr(err);
+            return null;
+        };
+    }
+
+    fn decompress(self: *Self, msg: *Message) !void {
+        _ = self; // autofix
+        // TODO: Support per-message-deflate
+        if (msg.compressed) {
+            return error.DeflateNotSupported;
+            // const buf = self.decompressor_buf orelse return error.DeflateNotSupported;
+            // try msg.decompress(self.allocator, buf);
+        }
+        try msg.validate();
+    }
+
+    fn readMessage(self: *Self) !Message {
+        // read first frame
+        var frame = try self.readDataFrame();
+
+        if (frame.isFin()) {
+            // if single frame return frame payload as message payload
+            // message takes ownership of the allocated payload
+            errdefer frame.deinit();
             var msg = Message{
                 .encoding = Message.Encoding.from(frame.opcode),
                 .compressed = frame.isCompressed(),
                 .allocator = self.allocator,
-                .payload = try self.allocator.dupe(u8, frame.payload),
+                .payload = frame.payload,
             };
-            errdefer msg.deinit();
-            frame.deinit();
-
-            while (true) {
-                frame = try self.readDataFrame();
-                defer frame.deinit();
-                try msg.append(frame.payload);
-                if (frame.isFin()) break;
-            }
             try self.decompress(&msg);
             return msg;
         }
 
-        pub fn sendMessage(self: *Self, msg: Message) !void {
-            try self.send(msg.encoding, msg.payload, false);
-        }
+        // other frames payload will be collected into payload
+        var msg = Message{
+            .encoding = Message.Encoding.from(frame.opcode),
+            .compressed = frame.isCompressed(),
+            .allocator = self.allocator,
+            .payload = try self.allocator.dupe(u8, frame.payload),
+        };
+        errdefer msg.deinit();
+        frame.deinit();
 
-        pub fn send(
-            self: *Self,
-            encoding: Message.Encoding,
-            payload: []const u8,
-            // prevent payload compression
-            // useful if payload is of already compressed type, for example jpg
-            no_compress: bool,
-        ) !void {
-            if (!no_compress and payload.len >= self.compress_threshold) {
-                if (self.compressor) |compressor| {
-                    // send compressed
-                    var output = std.ArrayList(u8).init(self.allocator);
-                    defer output.deinit();
-                    compressor.setWriter(output.writer());
-                    _ = try compressor.write(payload);
-                    try compressor.flush();
-                    const compressed = output.items[0 .. output.items.len - 4];
-                    if (self.reset_compressor) self.resetCompressor();
-                    return try self.writer.message(encoding, compressed, true);
-                }
-            }
-            try self.writer.message(encoding, payload, false);
-            return;
+        while (true) {
+            frame = try self.readDataFrame();
+            defer frame.deinit();
+            try msg.append(frame.payload);
+            if (frame.isFin()) break;
         }
+        try self.decompress(&msg);
+        return msg;
+    }
 
-        pub fn deinit(self: *Self) void {
-            if (self.compressor) |compressor|
-                self.allocator.destroy(compressor);
-            if (self.decompressor) |decompressor|
-                self.allocator.destroy(decompressor);
-            self.writer.deinit();
-        }
-    };
-}
+    pub fn sendMessage(self: *Self, msg: Message) !void {
+        try self.send(msg.encoding, msg.payload, false);
+    }
 
-pub fn Reader(comptime ReaderType: type) type {
-    const BitReader = io.BitReader(.big, ReaderType);
-    return struct {
-        bit_reader: BitReader,
-        allocator: Allocator,
-        deflate_supported: bool,
+    pub fn send(
+        self: *Self,
+        encoding: Message.Encoding,
+        payload: []const u8,
+        // prevent payload compression
+        // useful if payload is of already compressed type, for example jpg
+        no_compress: bool,
+    ) !void {
+        // TODO: Support per-message-deflate
+        if (!no_compress and payload.len >= self.compress_threshold and false) {
+            if (self.compressor) |compressor| {
+                // send compressed
+                var output = self.compressor_output.?;
+                // Reset compressor sink
+                output.writer.end = 0;
 
-        const Self = @This();
-
-        pub fn init(allocator: Allocator, inner_reader: ReaderType, deflate_supported: bool) Self {
-            return .{
-                .allocator = allocator,
-                .bit_reader = io.bitReader(.big, inner_reader),
-                .deflate_supported = deflate_supported,
-            };
-        }
-
-        fn readBit(self: *Self) !u1 {
-            return try self.bit_reader.readBitsNoEof(u1, 1);
-        }
-        fn readOpcode(self: *Self) !Frame.Opcode {
-            return try Frame.Opcode.decode(try self.bit_reader.readBitsNoEof(u4, 4));
-        }
-        fn readPayloadLen(self: *Self) !u64 {
-            const payload_len = try self.bit_reader.readBitsNoEof(u64, 7);
-            return switch (payload_len) {
-                126 => try self.bit_reader.readBitsNoEof(u64, 8 * 2),
-                127 => try self.bit_reader.readBitsNoEof(u64, 8 * 8),
-                else => payload_len,
-            };
-        }
-        fn readAll(self: *Self, buffer: []u8) !void {
-            var index: usize = 0;
-            while (index != buffer.len) {
-                const amt = try self.bit_reader.reader.read(buffer[index..]);
-                if (amt == 0) return error.EndOfStream;
-                index += amt;
+                try compressor.writer.writeAll(payload);
+                try compressor.writer.flush();
+                const compressed = output.written();
+                const out = compressed[0 .. compressed.len - 4];
+                if (self.reset_compressor) self.resetCompressor();
+                return try self.writer.message(encoding, out, true);
             }
         }
-        fn readPayload(self: *Self, payload_len: u64, masked: bool) ![]u8 {
-            if (payload_len == 0) return &.{};
-            var masking_key = [_]u8{0} ** 4;
-            if (masked) try self.readAll(&masking_key);
-            const payload = try self.allocator.alloc(u8, payload_len);
-            try self.readAll(payload);
-            if (masked) Frame.maskUnmask(&masking_key, payload);
-            return payload;
+        try self.writer.message(encoding, payload, false);
+        return;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.compressor) |compressor|
+            self.allocator.destroy(compressor);
+        if (self.compressor_buf) |buf| self.allocator.free(buf);
+        if (self.compressor_output) |output| {
+            output.deinit(); // frees the underlying allocated memory
+            self.allocator.destroy(output);
         }
+        self.writer.deinit();
+    }
+};
 
-        pub fn frame(self: *Self) !Frame {
-            const fin = try self.readBit();
-            const rsv1 = try self.readBit();
-            const rsv2 = try self.readBit();
-            const rsv3 = try self.readBit();
-            try Frame.assertRsvBits(rsv2, rsv3);
+pub const WebSocketReader = struct {
+    inner: *Io.Reader,
+    deflate_supported: bool,
 
-            const opcode = try self.readOpcode();
-            const mask = try self.readBit();
-            const payload_len = try self.readPayloadLen();
-            const payload = try self.readPayload(payload_len, mask == 1);
+    const Self = @This();
 
-            var frm = Frame{
-                .fin = fin,
-                .rsv1 = rsv1,
-                .mask = mask,
-                .opcode = opcode,
-                .payload = payload,
-                .allocator = if (payload.len > 0) self.allocator else null,
-            };
-            errdefer frm.deinit();
-            try frm.assertValid(self.deflate_supported);
-            return frm;
+    pub fn init(inner_reader: *Io.Reader, deflate_supported: bool) !Self {
+        if (deflate_supported) {
+            return error.DeflateNotSupported;
         }
-    };
-}
+        return .{
+            .inner = inner_reader,
+            .deflate_supported = deflate_supported,
+        };
+    }
 
-pub fn Writer(comptime WriterType: type) type {
-    return struct {
-        writer: WriterType,
-        buf: []u8,
-        allocator: Allocator,
+    fn readPayloadLen(self: *Self, byte: u8) !u64 {
+        return switch (byte) {
+            126 => try self.inner.takeInt(u16, .big),
+            127 => try self.inner.takeInt(u64, .big),
+            else => byte,
+        };
+    }
 
-        const Self = @This();
+    fn readAll(self: *Self, buffer: []u8) !void {
+        try self.inner.readSliceAll(buffer);
+    }
 
-        const writer_buffer_len = 4096;
+    fn readPayload(self: *Self, allocator: Allocator, payload_len: u64, masked: bool) ![]u8 {
+        if (payload_len == 0) return &.{};
+        var masking_key = [_]u8{0} ** 4;
+        if (masked) try self.readAll(&masking_key);
+        const payload = try allocator.alloc(u8, payload_len);
+        try self.readAll(payload);
+        if (masked) Frame.maskUnmask(&masking_key, payload);
+        return payload;
+    }
 
-        pub fn init(allocator: Allocator, inner_writer: WriterType) !Self {
-            return .{
-                .allocator = allocator,
-                .buf = try allocator.alloc(u8, writer_buffer_len),
-                .writer = inner_writer,
-            };
-        }
+    pub fn frame(self: *Self, allocator: Allocator) !Frame {
+        const b0 = try self.inner.takeByte();
+        const fin: u1 = @intCast(b0 >> 7);
+        const rsv1: u1 = @intCast((b0 >> 6) & 0x1);
+        const rsv2: u1 = @intCast((b0 >> 5) & 0x1);
+        const rsv3: u1 = @intCast((b0 >> 4) & 0x1);
+        try Frame.assertRsvBits(rsv2, rsv3);
 
-        pub fn pong(self: *Self, payload: []const u8) !void {
-            assert(payload.len < 126);
-            const frame = Frame{ .fin = 1, .opcode = .pong, .payload = payload, .mask = 1 };
+        const opcode = try Frame.Opcode.decode(@intCast(b0 & 0x0f));
+        const b1 = try self.inner.takeByte();
+        const mask: u1 = @intCast(b1 >> 7);
+        const payload_len = try self.readPayloadLen(b1 & 0x7f);
+
+        const payload = try self.readPayload(allocator, payload_len, mask == 1);
+
+        var frm = Frame{
+            .fin = fin,
+            .rsv1 = rsv1,
+            .mask = mask,
+            .opcode = opcode,
+            .payload = payload,
+            .allocator = if (payload.len > 0) allocator else null,
+        };
+        errdefer frm.deinit();
+        try frm.assertValid(self.deflate_supported);
+        return frm;
+    }
+};
+
+pub const WebSocketWriter = struct {
+    inner: *Io.Writer,
+    buf: []u8,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    const writer_buffer_len = 4096;
+
+    pub fn init(allocator: Allocator, inner_writer: *Io.Writer) !Self {
+        return .{
+            .allocator = allocator,
+            .buf = try allocator.alloc(u8, writer_buffer_len),
+            .inner = inner_writer,
+        };
+    }
+
+    pub fn pong(self: *Self, payload: []const u8) !void {
+        assert(payload.len < 126);
+        const frame = Frame{ .fin = 1, .opcode = .pong, .payload = payload, .mask = 1 };
+        const bytes = frame.encode(self.buf, 0);
+        try self.inner.writeAll(self.buf[0..bytes]);
+    }
+
+    pub fn close(self: *Self, code: u16, payload: []const u8) !void {
+        assert(payload.len < 124);
+        const frame = Frame{ .fin = 1, .opcode = .close, .payload = payload, .mask = 1 };
+        const bytes = frame.encode(self.buf, code);
+        try self.inner.writeAll(self.buf[0..bytes]);
+    }
+
+    pub fn message(self: *Self, encoding: Message.Encoding, payload: []const u8, compressed: bool) !void {
+        var sent_payload: usize = 0;
+        // send multiple frames if needed
+        while (true) {
+            const first_frame = sent_payload == 0;
+
+            var fin: u1 = 1;
+            const rsv1: u1 = if (compressed and first_frame) 1 else 0;
+
+            // use frame payload that fits into write_buf
+            var frame_payload = payload[sent_payload..];
+            if (frame_payload.len + Frame.max_header > self.buf.len) {
+                frame_payload = frame_payload[0 .. self.buf.len - Frame.max_header];
+                fin = 0;
+            }
+            const opcode = if (first_frame) encoding.opcode() else Frame.Opcode.continuation;
+
+            // create frame
+            const frame = Frame{ .fin = fin, .rsv1 = rsv1, .opcode = opcode, .payload = frame_payload, .mask = 1 };
+            // encode frame into write_buf and send it to stream
             const bytes = frame.encode(self.buf, 0);
-            try self.writer.writeAll(self.buf[0..bytes]);
-        }
-
-        pub fn close(self: *Self, code: u16, payload: []const u8) !void {
-            assert(payload.len < 124);
-            const frame = Frame{ .fin = 1, .opcode = .close, .payload = payload, .mask = 1 };
-            const bytes = frame.encode(self.buf, code);
-            try self.writer.writeAll(self.buf[0..bytes]);
-        }
-
-        pub fn message(self: *Self, encoding: Message.Encoding, payload: []const u8, compressed: bool) !void {
-            var sent_payload: usize = 0;
-            // send multiple frames if needed
-            while (true) {
-                const first_frame = sent_payload == 0;
-
-                var fin: u1 = 1;
-                const rsv1: u1 = if (compressed and first_frame) 1 else 0;
-
-                // use frame payload that fits into write_buf
-                var frame_payload = payload[sent_payload..];
-                if (frame_payload.len + Frame.max_header > self.buf.len) {
-                    frame_payload = frame_payload[0 .. self.buf.len - Frame.max_header];
-                    fin = 0;
-                }
-                const opcode = if (first_frame) encoding.opcode() else Frame.Opcode.continuation;
-
-                // create frame
-                const frame = Frame{ .fin = fin, .rsv1 = rsv1, .opcode = opcode, .payload = frame_payload, .mask = 1 };
-                // encode frame into write_buf and send it to stream
-                const bytes = frame.encode(self.buf, 0);
-                try self.writer.writeAll(self.buf[0..bytes]);
-                // loop if something is left
-                sent_payload += frame_payload.len;
-                if (sent_payload >= payload.len) {
-                    break;
-                }
+            try self.inner.writeAll(self.buf[0..bytes]);
+            // loop if something is left
+            sent_payload += frame_payload.len;
+            if (sent_payload >= payload.len) {
+                break;
             }
         }
+    }
 
-        pub fn deinit(self: *Self) void {
-            self.allocator.free(self.buf);
-        }
-    };
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.buf);
+    }
+};
+
+fn reader(inner_reader: *Io.Reader, deflate_supported: bool) !WebSocketReader {
+    return WebSocketReader.init(inner_reader, deflate_supported);
 }
 
-fn reader(allocator: Allocator, inner_reader: anytype, deflate_supported: bool) Reader(@TypeOf(inner_reader)) {
-    return Reader(@TypeOf(inner_reader)).init(allocator, inner_reader, deflate_supported);
-}
-
-fn writer(allocator: Allocator, inner_writer: anytype) !Writer(@TypeOf(inner_writer)) {
-    return try Writer(@TypeOf(inner_writer)).init(allocator, inner_writer);
+fn writer(allocator: Allocator, inner_writer: *Io.Writer) !WebSocketWriter {
+    return try WebSocketWriter.init(allocator, inner_writer);
 }
 
 // create websocket client stream
 pub fn client(
     allocator: Allocator,
-    inner_reader: anytype,
-    inner_writer: anytype,
+    inner_reader: *Io.Reader,
+    inner_writer: *Io.Writer,
     options: Options,
-) !Stream(@TypeOf(inner_reader), @TypeOf(inner_writer)) {
-    const S = Stream(@TypeOf(inner_reader), @TypeOf(inner_writer));
-    var stream = S{
+) !Stream {
+    if (options.per_message_deflate) {
+        return error.DeflateNotSupported;
+    }
+    var stream = Stream{
         .allocator = allocator,
-        .reader = reader(allocator, inner_reader, options.per_message_deflate),
+        .reader = try reader(inner_reader, options.per_message_deflate),
         .writer = try writer(allocator, inner_writer),
         .reset_compressor = options.client_no_context_takeover,
-        .reset_decompressor = options.server_no_context_takeover,
         .compress_threshold = options.compress_threshold,
     };
     if (options.per_message_deflate) {
         // NOTE: options.server_max_window_bits not used because not supported by std lib
-        stream.compressor = try allocator.create(S.CompressorType);
-        stream.decompressor = try allocator.create(S.DecompressorType);
+        stream.compressor_output = try allocator.create(Io.Writer.Allocating);
+        stream.compressor_output.?.* = try Io.Writer.Allocating.initCapacity(allocator, 4096);
+
+        stream.compressor_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        stream.decompressor_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+
+        // Allocate and initialize the compressor
+        stream.compressor = try allocator.create(Stream.CompressorType);
         stream.resetCompressor();
-        stream.resetDecompressor();
     }
     return stream;
 }
 
-const testing = std.testing;
-const expectEqual = testing.expectEqual;
-const expectEqualSlices = testing.expectEqualSlices;
-const expectError = testing.expectError;
-const testing_stream = @import("testing_stream.zig");
-
 test "reader read close frame" {
-    var input = [_]u8{ 0x88, 0x02, 0x03, 0xe8 };
-    var inner_stm = io.fixedBufferStream(&input);
-    var rdr = reader(testing.allocator, inner_stm.reader(), false);
-    var frame = try rdr.frame();
+    const input_bytes = [_]u8{ 0x88, 0x02, 0x03, 0xe8 };
+    var input = Io.Reader.fixed(&input_bytes);
+    var rdr = try reader(&input, false);
+    var frame = try rdr.frame(testing.allocator);
     defer frame.deinit();
 
     try expectEqual(frame.opcode, .close);
     try expectEqual(frame.fin, 1);
     try expectEqual(frame.payload.len, 2);
-    try expectEqualSlices(u8, frame.payload, input[2..4]);
+    try expectEqualSlices(u8, frame.payload, input_bytes[2..4]);
     try expectEqual(frame.closeCode(), 1000);
-    try expectError(error.EndOfStream, rdr.frame());
+    try expectError(error.EndOfStream, rdr.frame(testing.allocator));
 }
 
 test "reader read masked close frame with payload" {
-    var input = [_]u8{ 0x88, 0x87, 0xa, 0xb, 0xc, 0xd, 0x09, 0xe2, 0x0d, 0x0f, 0x09, 0x0f, 0x09 };
-    var inner_stm = io.fixedBufferStream(&input);
-    var rdr = reader(testing.allocator, inner_stm.reader(), false);
-    var frame = try rdr.frame();
+    const input_bytes = [_]u8{ 0x88, 0x87, 0xa, 0xb, 0xc, 0xd, 0x09, 0xe2, 0x0d, 0x0f, 0x09, 0x0f, 0x09 };
+    var input = Io.Reader.fixed(&input_bytes);
+    var rdr = try reader(&input, false);
+    var frame = try rdr.frame(testing.allocator);
     defer frame.deinit();
 
     const expected_payload = [_]u8{ 0x3, 0xe9, 0x1, 0x2, 0x3, 0x4, 0x5 };
@@ -475,7 +469,7 @@ test "reader read masked close frame with payload" {
     try expectEqual(frame.payload.len, 7);
     try expectEqualSlices(u8, frame.payload, &expected_payload);
     try expectEqual(frame.closeCode(), 1001);
-    try expectError(error.EndOfStream, rdr.frame());
+    try expectError(error.EndOfStream, rdr.frame(testing.allocator));
 }
 
 const fixture_fragmented_message =
@@ -486,8 +480,11 @@ const fixture_fragmented_message =
     [_]u8{ 0x80, 0x2, 0xe, 0xf };
 
 test "read fragmented message" {
-    var inner_stm = testing_stream.init(&fixture_fragmented_message);
-    var stm = try client(testing.allocator, inner_stm.reader(), inner_stm.writer(), .{});
+    var input = Io.Reader.fixed(&fixture_fragmented_message);
+    var output: Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+
+    var stm = try client(testing.allocator, &input, &output.writer, .{});
     defer stm.deinit();
 
     var msg = try stm.readMessage();
@@ -498,13 +495,14 @@ test "read fragmented message" {
     try testing.expectEqualSlices(u8, msg.payload, &[_]u8{ 0xa, 0xb, 0xc, 0xd, 0xe, 0xf });
 
     // expect pong in the output
-    try expectEqual(inner_stm.write_pos, 6); // pong header (2 bytes) + mask (4 bytes)
-    try testing.expectEqualSlices(u8, inner_stm.written()[0..2], &[_]u8{ 0x8a, 0x80 });
+    const written = output.written();
+    try expectEqual(written.len, 6); // pong header (2 bytes) + mask (4 bytes)
+    try testing.expectEqualSlices(u8, written[0..2], &[_]u8{ 0x8a, 0x80 });
 }
 
 test "reader read frames" {
-    var fbs = io.fixedBufferStream(&fixture_fragmented_message);
-    var rdr = reader(testing.allocator, fbs.reader(), false);
+    var input = Io.Reader.fixed(&fixture_fragmented_message);
+    var rdr = try reader(&input, false);
 
     const frames = [_]struct { Frame.Opcode, u1, usize }{
         // opcode, fin, payload_len
@@ -516,18 +514,21 @@ test "reader read frames" {
     };
 
     for (frames) |expected| {
-        var actual = try rdr.frame();
+        var actual = try rdr.frame(testing.allocator);
         defer actual.deinit();
         try testing.expectEqual(actual.opcode, expected[0]);
         try testing.expectEqual(actual.fin, expected[1]);
         try testing.expectEqual(actual.payload.len, expected[2]);
     }
-    try expectError(error.EndOfStream, rdr.frame());
+    try expectError(error.EndOfStream, rdr.frame(testing.allocator));
 }
 
 test "stream read frames" {
-    var inner_stm = testing_stream.init(&fixture_fragmented_message);
-    var stm = try client(testing.allocator, inner_stm.reader(), inner_stm.writer(), .{});
+    var input = Io.Reader.fixed(&fixture_fragmented_message);
+    var output: Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+
+    var stm = try client(testing.allocator, &input, &output.writer, .{});
     defer stm.deinit();
 
     const frames = [_]struct { Frame.Opcode, u1, usize }{
@@ -541,55 +542,55 @@ test "stream read frames" {
 
     var rdr = stm.reader;
     for (frames) |expected| {
-        var actual = try rdr.frame();
+        var actual = try rdr.frame(testing.allocator);
         defer actual.deinit();
         try testing.expectEqual(actual.opcode, expected[0]);
         try testing.expectEqual(actual.fin, expected[1]);
         try testing.expectEqual(actual.payload.len, expected[2]);
     }
-    try expectError(error.EndOfStream, rdr.frame());
+    try expectError(error.EndOfStream, rdr.frame(testing.allocator));
 }
 
 test "writer pong with payload" {
-    var output: [128]u8 = undefined;
-    var writer_stm = io.fixedBufferStream(&output);
-    var w = try writer(testing.allocator, writer_stm.writer());
+    var output_buf: [128]u8 = undefined;
+    var output_writer = Io.Writer.fixed(&output_buf);
+    var w = try writer(testing.allocator, &output_writer);
     defer w.deinit();
     const payload = "hello";
     try w.pong(payload);
 
-    try expectEqual(writer_stm.pos, 11); // pong header (2 bytes) + mask (4 bytes) + payload (5 bytes)
-    try testing.expectEqualSlices(u8, output[0..2], &[_]u8{ 0x8a, 0x85 });
-    Frame.maskUnmask(output[2..6], output[6 .. 6 + payload.len]);
-    try testing.expectEqualSlices(u8, output[6 .. 6 + payload.len], payload);
+    try expectEqual(output_writer.end, 11); // pong header (2 bytes) + mask (4 bytes) + payload (5 bytes)
+    try testing.expectEqualSlices(u8, output_writer.buffer[0..2], &[_]u8{ 0x8a, 0x85 });
+    Frame.maskUnmask(output_writer.buffer[2..6], output_writer.buffer[6 .. 6 + payload.len]);
+    try testing.expectEqualSlices(u8, output_writer.buffer[6 .. 6 + payload.len], payload);
 }
 
 test "writer close with payload" {
-    var output: [128]u8 = undefined;
-    var writer_stm = io.fixedBufferStream(&output);
-    var w = try writer(testing.allocator, writer_stm.writer());
+    var output_buf: [128]u8 = undefined;
+    var output_writer = Io.Writer.fixed(&output_buf);
+    var w = try writer(testing.allocator, &output_writer);
     defer w.deinit();
     const payload = "hello";
     try w.close(1002, payload);
 
-    try expectEqual(writer_stm.pos, 13); // pong header (2 bytes) + mask (4 bytes) + code (2 bytes) + payload (5 bytes)
-    try testing.expectEqualSlices(u8, output[0..2], &[_]u8{ 0x88, 0x87 });
-    Frame.maskUnmask(output[2..6], output[6 .. 8 + payload.len]);
-    try testing.expectEqualSlices(u8, output[8 .. 8 + payload.len], payload);
+    try expectEqual(output_writer.end, 13); // pong header (2 bytes) + mask (4 bytes) + code (2 bytes) + payload (5 bytes)
+    try testing.expectEqualSlices(u8, output_writer.buffer[0..2], &[_]u8{ 0x88, 0x87 });
+    Frame.maskUnmask(output_writer.buffer[2..6], output_writer.buffer[6 .. 8 + payload.len]);
+    try testing.expectEqualSlices(u8, output_writer.buffer[8 .. 8 + payload.len], payload);
 }
 
 test "writer message" {
-    var output: [128]u8 = undefined;
-    var writer_stm = io.fixedBufferStream(&output);
-    var w = try writer(testing.allocator, writer_stm.writer());
+    var output_buf: [128]u8 = undefined;
+    var output_writer = Io.Writer.fixed(&output_buf);
+    var w = try writer(testing.allocator, &output_writer);
     defer w.deinit();
     const payload = "hello world";
     try w.message(.text, payload, false);
 
-    try expectEqual(writer_stm.pos, 17); // pong header (2 bytes) + mask (4 bytes) +  payload (11 bytes)
-    try testing.expectEqualSlices(u8, output[0..2], &[_]u8{ 0x81, 0x8B });
-    Frame.maskUnmask(output[2..6], output[6 .. 6 + payload.len]);
-    try testing.expectEqualSlices(u8, output[6 .. 6 + payload.len], payload);
+    try expectEqual(output_writer.end, 17); // pong header (2 bytes) + mask (4 bytes) +  payload (11 bytes)
+    try testing.expectEqualSlices(u8, output_writer.buffer[0..2], &[_]u8{ 0x81, 0x8B });
+    Frame.maskUnmask(output_writer.buffer[2..6], output_writer.buffer[6 .. 6 + payload.len]);
+    try testing.expectEqualSlices(u8, output_writer.buffer[6 .. 6 + payload.len], payload);
 }
 
 // debug helper
@@ -604,66 +605,26 @@ test "deflate compress/decompress" {
     const allocator = testing.allocator;
     const text = "Hello";
 
-    const DecompressorType = std.compress.flate.Decompressor(io.FixedBufferStream([]const u8).Reader);
-    var decompressor: DecompressorType = .{};
+    var compressor_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor_buf: [std.compress.flate.max_window_len]u8 = undefined;
 
-    const CompressorType = std.compress.flate.Compressor(std.ArrayList(u8).Writer);
-    var compressor = brk: {
-        var dummy = std.ArrayList(u8).init(allocator);
-        defer dummy.deinit();
-        break :brk try CompressorType.init(dummy.writer(), .{});
-    };
+    var output: Io.Writer.Allocating = try Io.Writer.Allocating.initCapacity(allocator, 4096);
+    defer output.deinit();
 
-    for (0..128) |i| {
-        if (i % 5 == 0) {
-            decompressor = .{};
-            compressor = brk: {
-                var dummy = std.ArrayList(u8).init(allocator);
-                defer dummy.deinit();
-                break :brk try CompressorType.init(dummy.writer(), .{});
-            };
-        }
+    for (0..128) |_| {
+        output.writer.end = 0;
+        var compressor = try std.compress.flate.Compress.init(&output.writer, &compressor_buf, .raw, .default);
+        try compressor.writer.writeAll(text);
+        try compressor.finish();
+        const compressed = output.written();
 
-        const compressed: []const u8 = brk: {
-            var output = std.ArrayList(u8).init(allocator);
-            defer output.deinit();
-            compressor.setWriter(output.writer());
+        var input = Io.Reader.fixed(compressed);
+        var decompressor = std.compress.flate.Decompress.init(&input, .raw, &decompressor_buf);
 
-            _ = try compressor.write(text);
-            try compressor.flush();
-            break :brk try output.toOwnedSlice();
-        };
-        defer allocator.free(compressed);
+        var decompressed: Io.Writer.Allocating = .init(allocator);
+        defer decompressed.deinit();
+        _ = try decompressor.reader.streamRemaining(&decompressed.writer);
 
-        if (i % 5 == 0) {
-            try testing.expectEqualSlices(
-                u8,
-                compressed,
-                &[_]u8{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00, 0x00, 0xff, 0xff },
-            );
-        }
-        // std.debug.print("compressed {}: {x}\n", .{ compressed.len, compressed });
-        {
-            var output = std.ArrayList(u8).init(allocator);
-            defer output.deinit();
-
-            // on wire we remove last 4 bytes
-            var input = io.fixedBufferStream(compressed[0 .. compressed.len - 4]);
-            decompressor.setReader(input.reader());
-            decompressor.decompress(output.writer()) catch |err| switch (err) {
-                error.EndOfStream => {},
-                else => return err,
-            };
-            // add empty stored block
-            input = io.fixedBufferStream(&[_]u8{ 0x00, 0x00, 0xff, 0xff });
-            decompressor.setReader(input.reader());
-            decompressor.decompress(output.writer()) catch |err| switch (err) {
-                error.EndOfStream => {},
-                else => return err,
-            };
-
-            const decompressed = output.items;
-            try testing.expectEqualSlices(u8, text, decompressed);
-        }
+        try testing.expectEqualSlices(u8, text, decompressed.written());
     }
 }

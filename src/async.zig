@@ -3,10 +3,11 @@ const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
 
-const handshake = @import("handshake.zig");
-const Options = @import("stream.zig").Options;
 const Frame = @import("frame.zig").Frame;
+const resetRng = @import("frame.zig").resetRng;
+const handshake = @import("handshake.zig");
 const Message = @import("stream.zig").Message;
+const Options = @import("stream.zig").Options;
 
 pub const Msg = struct {
     encoding: Message.Encoding = .text,
@@ -132,7 +133,7 @@ pub fn Client(comptime Handler: type) type {
                     try rsp.validate(&self.sec_key);
                     const options = rsp.options;
                     if (options.per_message_deflate) {
-                        const decompressor = try self.allocator.create(DecompressorType);
+                        const decompressor = try self.allocator.create(std.compress.flate.Decompress);
                         decompressor.* = .{};
                         self.conn.decompressor = decompressor;
                         self.conn.reset_decompressor = options.server_no_context_takeover;
@@ -154,8 +155,6 @@ pub fn Client(comptime Handler: type) type {
     };
 }
 
-const DecompressorType = std.compress.flate.Decompressor(std.io.FixedBufferStream([]const u8).Reader);
-
 pub fn Conn(comptime Handler: type) type {
     return struct {
         const Self = @This();
@@ -163,8 +162,7 @@ pub fn Conn(comptime Handler: type) type {
         allocator: mem.Allocator,
         handler: *Handler,
 
-        decompressor: ?*DecompressorType = null, // not null if per_message_deflate is negotiated
-        reset_decompressor: bool = false, //        true if sliding window is not negotiated
+        decompressor_buf: ?[]u8 = null,
 
         last_frame_fragment: Frame.Fragment = .unfragmented,
         message: ?Message = null,
@@ -173,8 +171,6 @@ pub fn Conn(comptime Handler: type) type {
         pub fn deinit(self: *Self) void {
             if (self.message) |*msg|
                 msg.deinit();
-            if (self.decompressor) |decompressor|
-                self.allocator.destroy(decompressor);
         }
 
         pub fn recv(self: *Self, bytes: []u8) !usize {
@@ -184,7 +180,6 @@ pub fn Conn(comptime Handler: type) type {
                     error.SplitBuffer => return n,
                     else => return err,
                 };
-                try frm.assertValid(self.decompressor != null);
                 if (frm.opcode.isControl()) {
                     try self.recvControlFrame(frm);
                 } else {
@@ -255,10 +250,11 @@ pub fn Conn(comptime Handler: type) type {
         }
 
         fn recvMessage(self: *Self, msg: *Message) !void {
+            // TODO: Support per-message-deflate
             if (msg.compressed) {
-                const decompressor = self.decompressor orelse return error.DeflateNotSupported;
-                try msg.decompress(self.allocator, decompressor);
-                if (self.reset_decompressor) decompressor.* = .{};
+                return error.DeflateNotSupported;
+                // const buf = self.decompressor_buf orelse return error.DeflateNotSupported;
+                // try msg.decompress(self.allocator, buf);
             }
             try msg.validate();
             self.handler.onRecv(Msg{ .encoding = msg.encoding, .data = msg.payload });
@@ -306,6 +302,8 @@ test "async" {
             testing.allocator.free(buf);
         }
     };
+    resetRng(0);
+
     var handler: Handler = .{};
 
     var conn = Conn(Handler){ .allocator = testing.allocator, .handler = &handler, .mask = 1 };

@@ -1,6 +1,14 @@
 .{
-    .name = "ws",
+    .name = .ws,
     .version = "0.1.0",
+    .fingerprint = 0xe8abdd485e46d030, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{},
-    .paths = .{""},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "src",
+        "LICENSE",
+    },
 }

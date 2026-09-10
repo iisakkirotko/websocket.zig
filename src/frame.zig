@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const testing = std.testing;
 
@@ -7,6 +8,11 @@ const Allocator = mem.Allocator;
 const utf8ValidateSlice = std.unicode.utf8ValidateSlice;
 
 var rnd = std.Random.DefaultPrng.init(0);
+
+pub fn resetRng(seed: u64) void {
+    if (!builtin.is_test) @compileError("resetRng is only available in tests");
+    rnd = std.Random.DefaultPrng.init(seed);
+}
 
 pub const Error = error{
     ReservedOpcode,
