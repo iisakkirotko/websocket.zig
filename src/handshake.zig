@@ -90,6 +90,7 @@ pub const Client = struct {
     pub fn writeRequest(self: *Self, uri: []const u8) !void {
         var buf: [1024]u8 = undefined;
         try self.writer.writeAll(try requestBufPrint(&buf, uri, &self.sec_key));
+        try self.writer.flush();
     }
 
     pub fn assertValidResponse(self: *Self) !void {
