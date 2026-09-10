@@ -1,0 +1,66 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  unit-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run tests
+        run: zig build --verbose --summary all test
+
+  autobahn-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install podman
+        uses: redhat-actions/podman-install@v1
+
+      - name: Verify podman
+        run: podman --version
+
+      - name: Install websocat
+        run: |
+          wget -q https://github.com/vi/websocat/releases/download/v1.14.0/websocat.x86_64-unknown-linux-musl -O /usr/local/bin/websocat
+          chmod +x /usr/local/bin/websocat
+
+      - name: Start Autobahn
+        run: cd autobahn && ./start.sh
+
+      - name: Wait for server
+        run: sleep 5
+
+      - name: Run Autobahn tests
+        run: ./run_tests.sh
+
+      - name: Stop Autobahn
+        if: always()
+        run: ./autobahn/stop.sh
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-reports
+          path: autobahn/reports
