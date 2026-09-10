@@ -39,10 +39,10 @@ fn runTestCase(allocator: Allocator, io: std.Io, no: usize) !void {
 
     var read_buf: [4096]u8 = undefined;
     var write_buf: [4096]u8 = undefined;
-    var tcp_reader = tcp.reader(io, &read_buf).interface;
-    var tcp_writer = tcp.writer(io, &write_buf).interface;
+    var tcp_reader = tcp.reader(io, &read_buf);
+    var tcp_writer = tcp.writer(io, &write_buf);
 
-    var cli = try ws.client(allocator, &tcp_reader, &tcp_writer, uri);
+    var cli = try ws.client(allocator, &tcp_reader.interface, &tcp_writer.interface, uri);
     defer cli.deinit();
 
     // echo loop read and send message

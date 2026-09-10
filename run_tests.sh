@@ -9,4 +9,6 @@ msgs=$(websocat "$url/getCaseCount" -E --jsonrpc)
 ./zig-out/bin/autobahn_client "$msgs"
 websocat "$url/updateReports?agent=dummy" -E
 
-open $(pwd)/autobahn/reports/clients/index.html
+if [ -z "$CI" ] && command -v open >/dev/null 2>&1; then
+    open $(pwd)/autobahn/reports/clients/index.html
+fi
