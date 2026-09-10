@@ -173,14 +173,32 @@ pub const Client = struct {
         }
     };
 
+    fn logReader(self: *Self) void {
+        const content = self.reader.allocRemaining(self.arena.allocator(), .limited(4096)) catch |err| {
+            std.log.err("Invalid HTTP response, failed to read any content: {any}", .{err});
+            return;
+        };
+        defer self.arena.allocator().free(content);
+        std.log.err("Invalid HTTP response: {s}", .{content});
+    }
+
     pub fn parseResponse(self: *Self) !Response {
         // parse status line
-        var status_line = (try self.reader.takeDelimiter('\n')) orelse return error.InvalidHttpResponse;
+        var status_line = (try self.reader.takeDelimiter('\n')) orelse {
+            self.logReader();
+            return error.InvalidHttpResponse;
+        };
         if (std.mem.endsWith(u8, status_line, "\r")) {
             status_line = status_line[0 .. status_line.len - 1];
         }
-        const sp1 = mem.indexOfScalar(u8, status_line, ' ') orelse return error.InvalidHttpResponse;
-        const sp2 = mem.indexOfScalarPos(u8, status_line, sp1 + 1, ' ') orelse return error.InvalidHttpResponse;
+        const sp1 = mem.indexOfScalar(u8, status_line, ' ') orelse {
+            self.logReader();
+            return error.InvalidHttpResponse;
+        };
+        const sp2 = mem.indexOfScalarPos(u8, status_line, sp1 + 1, ' ') orelse {
+            self.logReader();
+            return error.InvalidHttpResponse;
+        };
 
         const alloc = self.arena.allocator();
         const protocol = try alloc.dupe(u8, status_line[0..sp1]);
@@ -191,7 +209,10 @@ pub const Client = struct {
         var headers: std.ArrayList(Header) = .empty;
         defer headers.deinit(alloc);
         while (true) {
-            var header_line = (try self.reader.takeDelimiter('\n')) orelse return error.InvalidHttpResponse;
+            var header_line = (try self.reader.takeDelimiter('\n')) orelse {
+                self.logReader();
+                return error.InvalidHttpResponse;
+            };
             if (std.mem.endsWith(u8, header_line, "\r")) {
                 header_line = header_line[0 .. header_line.len - 1];
             }
