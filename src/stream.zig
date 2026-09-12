@@ -224,7 +224,7 @@ pub const Stream = struct {
     }
 
     pub fn sendMessage(self: *Self, msg: Message) !void {
-        try self.send(msg.encoding, msg.payload, false);
+        try self.send(msg.encoding, msg.payload, true);
     }
 
     pub fn send(
@@ -356,6 +356,7 @@ pub const WebSocketWriter = struct {
         const frame = Frame{ .fin = 1, .opcode = .pong, .payload = payload, .mask = 1 };
         const bytes = frame.encode(self.buf, 0);
         try self.inner.writeAll(self.buf[0..bytes]);
+        try self.inner.flush();
     }
 
     pub fn close(self: *Self, code: u16, payload: []const u8) !void {
@@ -363,6 +364,7 @@ pub const WebSocketWriter = struct {
         const frame = Frame{ .fin = 1, .opcode = .close, .payload = payload, .mask = 1 };
         const bytes = frame.encode(self.buf, code);
         try self.inner.writeAll(self.buf[0..bytes]);
+        try self.inner.flush();
     }
 
     pub fn message(self: *Self, encoding: Message.Encoding, payload: []const u8, compressed: bool) !void {
@@ -387,6 +389,7 @@ pub const WebSocketWriter = struct {
             // encode frame into write_buf and send it to stream
             const bytes = frame.encode(self.buf, 0);
             try self.inner.writeAll(self.buf[0..bytes]);
+            try self.inner.flush();
             // loop if something is left
             sent_payload += frame_payload.len;
             if (sent_payload >= payload.len) {
