@@ -7,6 +7,9 @@ mkdir -p reports/clients
 mkdir -p reports/servers
 
 podman run -d --rm \
+    --health-cmd='python -c "import socket; s=socket.socket(); s.connect((\"127.0.0.1\",9001)); s.close()"' \
+    --health-interval=1s \
+    --health-retries=30 \
     -v "${PWD}/config:/config" \
     -v "${PWD}/reports:/reports" \
     --name fuzzingserver \

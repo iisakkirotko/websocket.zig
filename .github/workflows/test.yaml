@@ -49,7 +49,7 @@ jobs:
         run: cd autobahn && ./start.sh
 
       - name: Wait for server
-        run: sleep 5
+        run: timeout 60 podman wait --condition=healthy fuzzingserver
 
       - name: Run Autobahn tests
         run: ./run_tests.sh
