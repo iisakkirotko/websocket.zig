@@ -9,6 +9,8 @@ const expectEqual = testing.expectEqual;
 const expectEqualSlices = testing.expectEqualSlices;
 const expectError = testing.expectError;
 
+const Compressor = @import("compress.zig").Compressor;
+const Decompressor = @import("compress.zig").Decompressor;
 const Frame = @import("frame.zig").Frame;
 
 pub const Message = struct {
@@ -58,26 +60,10 @@ pub const Message = struct {
         self.payload = payload;
     }
 
-    pub fn decompress(self: *Message, allocator: mem.Allocator, decompress_buf: []u8) !void {
+    pub fn decompress(self: *Message, allocator: mem.Allocator, decompressor: *Decompressor) !void {
         if (!self.compressed) return;
-
-        // add empty stored block
-        const input = try allocator.alloc(u8, self.payload.len + 4);
-        defer allocator.free(input);
-        @memcpy(input[0..self.payload.len], self.payload);
-        @memcpy(input[self.payload.len..], &[_]u8{ 0x00, 0x00, 0xff, 0xff });
-
-        var output: Io.Writer.Allocating = .init(allocator);
-        defer output.deinit();
-
-        // push payload to decompressor
-        var in_reader: Io.Reader = .fixed(input);
-        var decompressor: std.compress.flate.Decompress = .init(&in_reader, .raw, decompress_buf);
-
-        _ = try decompressor.reader.streamRemaining(&output.writer);
-
         const old_payload = self.payload;
-        self.payload = try output.toOwnedSlice();
+        self.payload = try decompressor.decompressAlloc(allocator, self.payload);
         if (self.allocator) |a| a.free(old_payload);
         self.allocator = allocator;
         self.compressed = false;
@@ -106,7 +92,7 @@ pub const Options = struct {
 };
 
 pub const Stream = struct {
-    const CompressorType = std.compress.flate.Compress;
+    const CompressorType = Compressor;
     const Self = @This();
 
     reader: WebSocketReader,
@@ -120,20 +106,12 @@ pub const Stream = struct {
 
     // message compression
     compressor: ?*CompressorType = null, //     not null if per_message_deflate is negotiated
-    compressor_output: ?*std.Io.Writer.Allocating = null, // sink
-    compressor_buf: ?[]u8 = null,
-    decompressor_buf: ?[]u8 = null,
+    decompressor: ?*Decompressor = null,
     reset_compressor: bool = false, //          true if sliding window is not negotiated
     compress_threshold: usize = 126, //         don't compress tiny payload
 
     fn resetCompressor(self: *Self) void {
-        const output = self.compressor_output.?;
-        self.compressor.?.* = CompressorType.init(
-            &output.writer,
-            self.compressor_buf.?,
-            .raw,
-            .default,
-        ) catch unreachable;
+        self.compressor.?.reset();
     }
 
     fn readDataFrame(self: *Self) !Frame {
@@ -175,12 +153,9 @@ pub const Stream = struct {
     }
 
     fn decompress(self: *Self, msg: *Message) !void {
-        _ = self; // autofix
-        // TODO: Support per-message-deflate
         if (msg.compressed) {
-            return error.DeflateNotSupported;
-            // const buf = self.decompressor_buf orelse return error.DeflateNotSupported;
-            // try msg.decompress(self.allocator, buf);
+            const decompressor = self.decompressor orelse return error.DeflateNotSupported;
+            try msg.decompress(self.allocator, decompressor);
         }
         try msg.validate();
     }
@@ -224,7 +199,7 @@ pub const Stream = struct {
     }
 
     pub fn sendMessage(self: *Self, msg: Message) !void {
-        try self.send(msg.encoding, msg.payload, true);
+        try self.send(msg.encoding, msg.payload, false);
     }
 
     pub fn send(
@@ -235,18 +210,9 @@ pub const Stream = struct {
         // useful if payload is of already compressed type, for example jpg
         no_compress: bool,
     ) !void {
-        // TODO: Support per-message-deflate
-        if (!no_compress and payload.len >= self.compress_threshold and false) {
+        if (!no_compress and payload.len >= self.compress_threshold) {
             if (self.compressor) |compressor| {
-                // send compressed
-                var output = self.compressor_output.?;
-                // Reset compressor sink
-                output.writer.end = 0;
-
-                try compressor.writer.writeAll(payload);
-                try compressor.writer.flush();
-                const compressed = output.written();
-                const out = compressed[0 .. compressed.len - 4];
+                const out = try compressor.compress(payload);
                 if (self.reset_compressor) self.resetCompressor();
                 return try self.writer.message(encoding, out, true);
             }
@@ -256,12 +222,13 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.compressor) |compressor|
+        if (self.compressor) |compressor| {
+            compressor.deinit(self.allocator);
             self.allocator.destroy(compressor);
-        if (self.compressor_buf) |buf| self.allocator.free(buf);
-        if (self.compressor_output) |output| {
-            output.deinit(); // frees the underlying allocated memory
-            self.allocator.destroy(output);
+        }
+        if (self.decompressor) |decompressor| {
+            decompressor.deinit(self.allocator);
+            self.allocator.destroy(decompressor);
         }
         self.writer.deinit();
     }
@@ -274,9 +241,6 @@ pub const WebSocketReader = struct {
     const Self = @This();
 
     pub fn init(inner_reader: *Io.Reader, deflate_supported: bool) !Self {
-        if (deflate_supported) {
-            return error.DeflateNotSupported;
-        }
         return .{
             .inner = inner_reader,
             .deflate_supported = deflate_supported,
@@ -418,9 +382,6 @@ pub fn client(
     inner_writer: *Io.Writer,
     options: Options,
 ) !Stream {
-    if (options.per_message_deflate) {
-        return error.DeflateNotSupported;
-    }
     var stream = Stream{
         .allocator = allocator,
         .reader = try reader(inner_reader, options.per_message_deflate),
@@ -430,15 +391,14 @@ pub fn client(
     };
     if (options.per_message_deflate) {
         // NOTE: options.server_max_window_bits not used because not supported by std lib
-        stream.compressor_output = try allocator.create(Io.Writer.Allocating);
-        stream.compressor_output.?.* = try Io.Writer.Allocating.initCapacity(allocator, 4096);
 
-        stream.compressor_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
-        stream.decompressor_buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        const comp = try allocator.create(Compressor);
+        comp.* = try Compressor.init(allocator);
+        stream.compressor = comp;
 
-        // Allocate and initialize the compressor
-        stream.compressor = try allocator.create(Stream.CompressorType);
-        stream.resetCompressor();
+        const decomp = try allocator.create(Decompressor);
+        decomp.* = try Decompressor.init(allocator);
+        stream.decompressor = decomp;
     }
     return stream;
 }
@@ -629,5 +589,59 @@ test "deflate compress/decompress" {
         _ = try decompressor.reader.streamRemaining(&decompressed.writer);
 
         try testing.expectEqualSlices(u8, text, decompressed.written());
+    }
+}
+
+// Exercises the real Stream.send() compression path for per-message-deflate
+// and round-trips the payload through the Decompressor wrapper.
+test "per-message-deflate trailing block round trip via Stream.send" {
+    const allocator = testing.allocator;
+
+    const payloads = [_][]const u8{
+        "Hello",
+        "Hello world",
+        "The quick brown fox jumps over the lazy dog",
+        "aaaa",
+        "aaaaaaaaaaaaaaaa",
+        "abababababababab",
+        &[_]u8{0} ** 100,
+        &[_]u8{1} ** 500,
+        &[_]u8{0x00} ** 1000,
+        &[_]u8{0xff} ** 1000,
+        "\x00\x00\x00\x00",
+        "\xff\xff\xff\xff",
+        "{\"type\":\"ping\"}",
+        "<?xml version=\"1.0\"?><root></root>",
+    };
+
+    for (payloads) |payload| {
+        const input_bytes = [_]u8{};
+        var input = Io.Reader.fixed(&input_bytes);
+        var output: Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+
+        var stm = try client(allocator, &input, &output.writer, .{
+            .per_message_deflate = true,
+            .compress_threshold = 1,
+        });
+        defer stm.deinit();
+
+        try stm.send(.text, payload, false);
+
+        const frame_data = output.written();
+        const frame_buf = try allocator.dupe(u8, frame_data);
+        defer allocator.free(frame_buf);
+
+        const frame, _ = try Frame.parse(frame_buf);
+        try testing.expect(frame.isCompressed());
+
+        var decompressor = try Decompressor.init(allocator);
+        defer decompressor.deinit(allocator);
+
+        const decompressed = try decompressor.decompressAlloc(allocator, frame.payload);
+        defer allocator.free(decompressed);
+
+        errdefer std.debug.print("failed payload len={d} data={any}\n", .{ payload.len, payload });
+        try testing.expectEqualSlices(u8, payload, decompressed);
     }
 }

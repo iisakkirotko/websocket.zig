@@ -7,9 +7,7 @@
     ],
     "exclude-cases": [
         "6.4.*",
-        "9.*",
-        "12.*",
-        "13.*"
+        "9.*"
     ],
     "exclude-agent-cases": {}
 }
