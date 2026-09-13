@@ -34,4 +34,18 @@ pub fn build(b: *std.Build) void {
         .root_module = autobahn_client_module,
     });
     b.installArtifact(autobahn_client);
+
+    // Build in-memory benchmark
+    const benchmark_module = b.createModule(.{
+        .root_source_file = b.path("examples/benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    benchmark_module.addImport("ws", ws_module);
+
+    const benchmark = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = benchmark_module,
+    });
+    b.installArtifact(benchmark);
 }

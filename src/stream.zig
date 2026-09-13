@@ -9,9 +9,9 @@ const expectEqual = testing.expectEqual;
 const expectEqualSlices = testing.expectEqualSlices;
 const expectError = testing.expectError;
 
-const Compressor = @import("compress.zig").Compressor;
+pub const Compressor = @import("compress.zig").Compressor;
 const Decompressor = @import("compress.zig").Decompressor;
-const Frame = @import("frame.zig").Frame;
+pub const Frame = @import("frame.zig").Frame;
 
 pub const Message = struct {
     pub const Encoding = enum {
