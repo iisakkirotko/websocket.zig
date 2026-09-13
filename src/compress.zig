@@ -64,30 +64,20 @@ pub const Compressor = struct {
 };
 
 pub const Decompressor = struct {
-    decompressor: ?*DecompressorType = null,
+    decompressor: ?DecompressorType = null,
     buf: []u8,
-    reader: ?*std.Io.Reader = null,
+    reader: ?Io.Reader = null,
     output: *Io.Writer.Allocating,
 
     pub fn init(allocator: Allocator) !Decompressor {
         const buf = try allocator.alloc(u8, std.compress.flate.max_window_len);
         errdefer allocator.free(buf);
 
-        // const fixed = try allocator.create(Io.Reader);
-        // errdefer allocator.free(fixed);
-        // fixed.* = .fixed(buf);
-
-        // const decompressor = try allocator.create(DecompressorType);
-        // errdefer allocator.free(decompressor);
-        // decompressor.* = .init(&fixed, .raw, buf);
-
         const output = try allocator.create(Io.Writer.Allocating);
         errdefer output.deinit();
         output.* = .init(allocator);
         return .{
-            // .decompressor = decompressor,
             .buf = buf,
-            // .reader = fixed,
             .output = output,
         };
     }
@@ -98,7 +88,9 @@ pub const Decompressor = struct {
         allocator.destroy(self.output);
     }
 
-    pub fn reset() void {}
+    pub fn reset(self: *Decompressor) void {
+        self.decompressor = null;
+    }
 
     fn runDecompress(self: *Decompressor, allocator: Allocator, compressed: []const u8) !void {
         const input = try allocator.alloc(u8, compressed.len + 4);
@@ -108,19 +100,21 @@ pub const Decompressor = struct {
         // already in the last byte(s) of the compressed payload from syncFlush.
         @memcpy(input[compressed.len..], &[_]u8{ 0x00, 0x00, 0xff, 0xff });
 
-        var fixed: Io.Reader = .fixed(input);
-
-        var decompressor: DecompressorType = .init(&fixed, .raw, self.buf);
+        var reader = Io.Reader.fixed(input);
+        self.reader = reader;
+        if (self.decompressor == null) {
+            self.decompressor = .init(&reader, .raw, self.buf);
+        }
 
         // Reset output sink
         var output = self.output;
         output.writer.end = 0;
-        _ = decompressor.reader.streamRemaining(&output.writer) catch |err| switch (err) {
+        _ = self.decompressor.?.reader.streamRemaining(&output.writer) catch |err| switch (err) {
             error.ReadFailed => {
                 // The stdlib decompressor treats a non-final EndOfStream as an error.
                 // For per-message-deflate the empty stored block is non-final to allow
                 // context takeover, so this is the expected termination path.
-                const underlying = decompressor.err orelse return error.ReadFailed;
+                const underlying = self.decompressor.?.err orelse return error.ReadFailed;
                 if (underlying != error.EndOfStream) return error.ReadFailed;
             },
             else => |e| return e,

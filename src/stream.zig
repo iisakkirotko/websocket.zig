@@ -108,6 +108,7 @@ pub const Stream = struct {
     compressor: ?*CompressorType = null, //     not null if per_message_deflate is negotiated
     decompressor: ?*Decompressor = null,
     reset_compressor: bool = false, //          true if sliding window is not negotiated
+    reset_decompressor: bool = false,
     compress_threshold: usize = 126, //         don't compress tiny payload
 
     fn resetCompressor(self: *Self) void {
@@ -156,6 +157,7 @@ pub const Stream = struct {
         if (msg.compressed) {
             const decompressor = self.decompressor orelse return error.DeflateNotSupported;
             try msg.decompress(self.allocator, decompressor);
+            if (self.reset_decompressor) decompressor.reset();
         }
         try msg.validate();
     }
@@ -387,6 +389,7 @@ pub fn client(
         .reader = try reader(inner_reader, options.per_message_deflate),
         .writer = try writer(allocator, inner_writer),
         .reset_compressor = options.client_no_context_takeover,
+        .reset_decompressor = options.server_no_context_takeover,
         .compress_threshold = options.compress_threshold,
     };
     if (options.per_message_deflate) {
