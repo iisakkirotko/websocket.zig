@@ -89,7 +89,10 @@ pub const Client = struct {
 
     pub fn writeRequest(self: *Self, uri: []const u8) !void {
         var buf: [1024]u8 = undefined;
-        try self.writer.writeAll(try requestBufPrint(&buf, uri, &self.sec_key));
+        const payload = try requestBufPrint(&buf, uri, &self.sec_key);
+        std.debug.print("Writing request: {s}\n", .{payload});
+        try self.writer.writeAll(payload);
+        std.debug.print("Wrote request", .{});
         try self.writer.flush();
     }
 
@@ -184,10 +187,11 @@ pub const Client = struct {
 
     pub fn parseResponse(self: *Self) !Response {
         // parse status line
-        var status_line = (try self.reader.takeDelimiter('\n')) orelse {
+        var status_line = try self.reader.takeDelimiter('\n') orelse {
             self.logReader();
             return error.InvalidHttpResponse;
         };
+        std.debug.print("Read response status: {s}", .{status_line});
         if (std.mem.endsWith(u8, status_line, "\r")) {
             status_line = status_line[0 .. status_line.len - 1];
         }
@@ -254,6 +258,7 @@ pub fn client(allocator: Allocator, reader: *Io.Reader, writer: *Io.Writer, uri:
     var cs: Client = .init(allocator, reader, writer);
     defer cs.deinit();
     try cs.writeRequest(uri);
+    std.debug.print("Done sending request, will assert res is valid", .{});
     try cs.assertValidResponse();
     return cs.options;
 }
